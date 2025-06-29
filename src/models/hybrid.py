@@ -1,83 +1,116 @@
-import torch
-import torch.nn as nn
+import os
+import json
 import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+import pytorch_lightning as pl
+from torch import nn
+from pytorch_lightning.callbacks import ModelCheckpoint
 
-class HybridRecommender:
-    def __init__(self, n_users, n_items, n_factors=100, hidden_dim=256):
-        self.n_factors = n_factors
-        self.hidden_dim = hidden_dim
-        self.model = None
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.n_users = n_users
-        self.n_items = n_items
-        self._build_model(n_users, n_items)
-    
-    def _build_model(self, n_users, n_items):
-        class HybridModel(nn.Module):
-            def __init__(self, n_users, n_items, n_factors, hidden_dim):
-                super(HybridModel, self).__init__()
-                # Embeddings
-                self.user_embedding = nn.Embedding(n_users, n_factors)
-                self.item_embedding = nn.Embedding(n_items, n_factors)
-                # Simple MLP
-                self.fc_layers = nn.Sequential(
-                    nn.Linear(n_factors * 2 + 1, hidden_dim),  # +1 for sentiment
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(hidden_dim, hidden_dim // 2),
-                    nn.ReLU(),
-                    nn.Dropout(0.2),
-                    nn.Linear(hidden_dim // 2, 1)
-                )
-            def forward(self, user_input, item_input, sentiment):
-                user_embedded = self.user_embedding(user_input)
-                item_embedded = self.item_embedding(item_input)
-                # Stack all features
-                concat = torch.cat([user_embedded, item_embedded, sentiment.unsqueeze(1)], dim=1)
-                return self.fc_layers(concat)
-        self.model = HybridModel(n_users, n_items, self.n_factors, self.hidden_dim)
-        self.model.to(self.device)
-    
-    def train(self, train_data, content_features, n_epochs=10, batch_size=32, learning_rate=0.001):
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
-        users = torch.LongTensor(train_data['user_idx'].values).to(self.device)
-        items = torch.LongTensor(train_data['movie_idx'].values).to(self.device)
-        ratings = torch.FloatTensor(train_data['rating'].values).to(self.device)
-        sentiments = torch.FloatTensor([0.0] * len(train_data)).to(self.device)  # placeholder
-        for epoch in range(n_epochs):
-            self.model.train()
-            total_loss = 0
-            for i in range(0, len(train_data), batch_size):
-                batch_users = users[i:i+batch_size]
-                batch_items = items[i:i+batch_size]
-                batch_ratings = ratings[i:i+batch_size]
-                batch_sentiments = sentiments[i:i+batch_size]
-                preds = self.model(batch_users, batch_items, batch_sentiments)
-                loss = criterion(preds.squeeze(), batch_ratings)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            avg_loss = total_loss / (len(train_data) / batch_size)
-            print(f"Epoch {epoch+1}/{n_epochs}, Loss: {avg_loss:.4f}")
-    
-    def predict(self, user_idx, item_idx, sentiment_score=0.0):
-        self.model.eval()
-        with torch.no_grad():
-            user_tensor = torch.LongTensor([user_idx]).to(self.device)
-            item_tensor = torch.LongTensor([item_idx]).to(self.device)
-            sentiment_tensor = torch.FloatTensor([sentiment_score]).to(self.device)
-            prediction = self.model(user_tensor, item_tensor, sentiment_tensor)
-            return prediction.item()
-    
-    def get_recommendations(self, user_idx, n_recommendations=10, sentiment_scores=None):
-        if sentiment_scores is None:
-            sentiment_scores = {idx: 0.0 for idx in range(self.model.item_embedding.num_embeddings)}
-        predictions = []
-        for item_idx in range(self.model.item_embedding.num_embeddings):
-            pred = self.predict(user_idx, item_idx, sentiment_scores[item_idx])
-            predictions.append((item_idx, pred))
-        # Top N
-        predictions.sort(key=lambda x: x[1], reverse=True)
-        return [item_idx for item_idx, _ in predictions[:n_recommendations]] 
+PROCESSED_DIR = os.path.join(os.path.dirname(__file__), '../../data/processed/')
+RATINGS_PATH = os.path.join(PROCESSED_DIR, 'ratings.csv')
+USER_EMB_PATH = os.path.join(PROCESSED_DIR, 'user_cf_embeddings.npy')
+ITEM_EMB_PATH = os.path.join(PROCESSED_DIR, 'item_cf_embeddings.npy')
+BERT_EMB_PATH = os.path.join(PROCESSED_DIR, 'item_bert_embeddings.npy')
+USER_MAP_PATH = os.path.join(PROCESSED_DIR, 'user_id_map.json')
+ITEM_MAP_PATH = os.path.join(PROCESSED_DIR, 'item_id_map.json')
+BERT_IDS_PATH = os.path.join(PROCESSED_DIR, 'item_bert_ids.npy')
+
+BATCH_SIZE = 1024
+EPOCHS = 5
+
+# 1. Load mappings and embeddings
+with open(USER_MAP_PATH) as f:
+    user2idx = json.load(f)
+with open(ITEM_MAP_PATH) as f:
+    item2idx = json.load(f)
+bert_item_ids = np.load(BERT_IDS_PATH, allow_pickle=True)
+bert_embs = np.load(BERT_EMB_PATH)
+user_embs = np.load(USER_EMB_PATH)
+item_embs = np.load(ITEM_EMB_PATH)
+
+# Map itemId to BERT embedding index
+bert_id2idx = {item_id: i for i, item_id in enumerate(bert_item_ids)}
+
+# 2. Load ratings and map IDs to indices
+df = pd.read_csv(RATINGS_PATH)
+df = df[df['userId'].isin(user2idx) & df['itemId'].isin(item2idx) & df['itemId'].isin(bert_id2idx)]
+df['user_idx'] = df['userId'].map(user2idx)
+df['item_idx'] = df['itemId'].map(item2idx)
+df['bert_idx'] = df['itemId'].map(bert_id2idx)
+
+# 3. Dataset
+class HybridDataset(Dataset):
+    def __init__(self, df):
+        self.user_idx = df['user_idx'].values
+        self.item_idx = df['item_idx'].values
+        self.bert_idx = df['bert_idx'].values
+        self.ratings = df['rating'].values.astype(np.float32)
+    def __len__(self):
+        return len(self.user_idx)
+    def __getitem__(self, idx):
+        return self.user_idx[idx], self.item_idx[idx], self.bert_idx[idx], self.ratings[idx]
+
+dataset = HybridDataset(df)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+
+# 4. Hybrid Model
+class HybridModel(pl.LightningModule):
+    def __init__(self, user_embs, item_embs, bert_embs):
+        super().__init__()
+        self.user_embs = nn.Embedding.from_pretrained(torch.tensor(user_embs, dtype=torch.float32), freeze=True)
+        self.item_embs = nn.Embedding.from_pretrained(torch.tensor(item_embs, dtype=torch.float32), freeze=True)
+        self.bert_embs = nn.Embedding.from_pretrained(torch.tensor(bert_embs, dtype=torch.float32), freeze=True)
+        cf_dim = user_embs.shape[1] + item_embs.shape[1]
+        cbf_dim = bert_embs.shape[1]
+        gate_in_dim = cf_dim + cbf_dim
+        # Explicit scalar gate
+        self.gate_layer = nn.Sequential(
+            nn.Linear(gate_in_dim, 1),
+            nn.Sigmoid()
+        )
+        # Dense layers after fusion
+        self.mlp = nn.Sequential(
+            nn.Linear(max(cf_dim, cbf_dim), 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        self.loss_fn = nn.MSELoss()
+    def forward(self, user_idx, item_idx, bert_idx):
+        u = self.user_embs(user_idx)
+        i = self.item_embs(item_idx)
+        b = self.bert_embs(bert_idx)
+        cf_vec = torch.cat([u, i], dim=-1)  # shape: (batch, cf_dim)
+        cbf_vec = b  # shape: (batch, cbf_dim)
+        # Gate input: concat original cf_vec and cbf_vec
+        gate_input = torch.cat([cf_vec, cbf_vec], dim=-1)  # shape: (batch, cf_dim + cbf_dim)
+        gate = self.gate_layer(gate_input)  # shape: (batch, 1)
+        # Pad cf_vec or cbf_vec for blending if needed
+        if cf_vec.shape[1] > cbf_vec.shape[1]:
+            pad = cf_vec.shape[1] - cbf_vec.shape[1]
+            cbf_vec = torch.nn.functional.pad(cbf_vec, (0, pad))
+        elif cbf_vec.shape[1] > cf_vec.shape[1]:
+            pad = cbf_vec.shape[1] - cf_vec.shape[1]
+            cf_vec = torch.nn.functional.pad(cf_vec, (0, pad))
+        final_vec = gate * cf_vec + (1 - gate) * cbf_vec
+        out = self.mlp(final_vec).squeeze(-1)
+        return out
+    def training_step(self, batch, batch_idx):
+        user_idx, item_idx, bert_idx, rating = batch
+        pred = self(user_idx, item_idx, bert_idx)
+        loss = self.loss_fn(pred, rating)
+        self.log('train_loss', loss)
+        return loss
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=1e-3)
+
+model = HybridModel(user_embs, item_embs, bert_embs)
+
+# 5. Train with checkpointing
+checkpoint_callback = ModelCheckpoint(
+    dirpath=PROCESSED_DIR, filename='hybrid_model_best', save_top_k=1, monitor='train_loss', mode='min')
+trainer = pl.Trainer(max_epochs=EPOCHS, logger=False, callbacks=[checkpoint_callback], enable_model_summary=False)
+trainer.fit(model, dataloader)
+
+print("Training complete. Best model saved.") 
